@@ -1,0 +1,886 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hydrophone Visuals — Prototype</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; font-family: -apple-system, "Helvetica Neue", sans-serif; }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #overlay {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 24px;
+    background: radial-gradient(ellipse at center, #041c2c 0%, #000 75%);
+    color: #cfe8f5; text-align: center; z-index: 10; transition: opacity .6s;
+  }
+  #overlay.hidden { opacity: 0; pointer-events: none; }
+  #overlay h1 { font-weight: 200; font-size: 2rem; letter-spacing: .3em; text-transform: uppercase; }
+  #overlay p { opacity: .6; max-width: 420px; line-height: 1.6; }
+  #startBtn {
+    padding: 14px 44px; font-size: 1rem; letter-spacing: .2em; text-transform: uppercase;
+    background: transparent; color: #7fd4f0; border: 1px solid #2a6a85; border-radius: 40px;
+    cursor: pointer; transition: all .3s;
+  }
+  #startBtn:hover { background: #7fd4f022; border-color: #7fd4f0; }
+
+  #hud {
+    position: fixed; bottom: 0; left: 0; right: 0; z-index: 5;
+    display: flex; align-items: center; gap: 18px; padding: 14px 20px;
+    background: linear-gradient(transparent, #000a);
+    color: #9fc6d8; font-size: 12px; opacity: 0; transition: opacity .3s;
+  }
+  body.started #hud:hover, body.started.show-hud #hud { opacity: 1; }
+  #hud .modes { display: flex; gap: 8px; }
+  #hud button {
+    padding: 6px 14px; font-size: 11px; letter-spacing: .1em; cursor: pointer;
+    background: #ffffff10; color: #9fc6d8; border: 1px solid #ffffff22; border-radius: 20px;
+    transition: all .2s;
+  }
+  #hud button.active, #hud button:hover { background: #7fd4f025; color: #cfeeff; border-color: #7fd4f0aa; }
+  #hud label { display: flex; align-items: center; gap: 8px; }
+  #hud input[type=range] { width: 110px; accent-color: #7fd4f0; }
+  #vu { width: 90px; height: 6px; background: #ffffff15; border-radius: 3px; overflow: hidden; }
+  #vu div { height: 100%; width: 0%; background: linear-gradient(90deg, #2aa9d2, #7fefb0); transition: width .05s; }
+  #hint { position: fixed; top: 14px; right: 18px; z-index: 5; color: #ffffff55; font-size: 11px; letter-spacing: .1em; opacity: 0; transition: opacity .3s; }
+  body.started #hint { opacity: 1; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+
+<div id="overlay">
+  <h1>Hydrophone</h1>
+  <p>Prototype de projection audio-réactive. Autorise le micro, puis fais du son — l'hydrophone se branchera ici plus tard, comme n'importe quelle entrée audio.</p>
+  <button id="startBtn">▶ &nbsp;Écouter</button>
+</div>
+
+<div id="hud">
+  <div class="modes">
+    <button data-mode="organic" class="active">Organique</button>
+    <button data-mode="spectrum">Spectre</button>
+    <button data-mode="abstract">Abstrait</button>
+    <button data-mode="tadpoles">Têtards</button>
+    <button data-mode="birds">Oiseaux</button>
+    <button data-mode="images">Images</button>
+  </div>
+  <label>Sensibilité <input type="range" id="gain" min="0.5" max="8" step="0.1" value="2.5"></label>
+  <div id="vu"><div></div></div>
+  <span style="margin-left:auto">1–6 : styles · F : plein écran</span>
+</div>
+<div id="hint">bouge la souris en bas pour les réglages</div>
+
+<script>
+// ————————————————————————————— Audio —————————————————————————————
+const FFT_SIZE = 2048;
+let audioCtx, analyser, freqData, timeData;
+let sensitivity = 2.5;
+
+// Valeurs d'analyse lissées, consommées par les visuels
+const audio = {
+  level: 0,      // volume global 0..1
+  bass: 0,       // énergie graves 0..1
+  mid: 0,        // énergie médiums 0..1
+  treble: 0,     // énergie aigus 0..1
+  transient: 0,  // pic soudain (retombe vite) — pour les "événements" sonores
+};
+let prevLevel = 0;
+
+async function startAudio() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    throw new Error("L'accès micro exige un contexte sécurisé — ouvre la page via http://localhost ou https, pas depuis un panneau intégré.");
+  }
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+  });
+  const source = audioCtx.createMediaStreamSource(stream);
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = FFT_SIZE;
+  analyser.smoothingTimeConstant = 0.75;
+  source.connect(analyser);
+  freqData = new Uint8Array(analyser.frequencyBinCount);
+  timeData = new Uint8Array(analyser.fftSize);
+}
+
+function bandEnergy(from, to) { // moyenne normalisée sur une plage de bins
+  let sum = 0;
+  for (let i = from; i < to; i++) sum += freqData[i];
+  return sum / (to - from) / 255;
+}
+
+function updateAudio() {
+  if (!analyser) return;
+  analyser.getByteFrequencyData(freqData);
+  analyser.getByteTimeDomainData(timeData);
+
+  const n = analyser.frequencyBinCount; // ~1024 bins jusqu'à ~24kHz
+  const rawBass = bandEnergy(1, Math.floor(n * 0.02));       // ~20–500 Hz
+  const rawMid = bandEnergy(Math.floor(n * 0.02), Math.floor(n * 0.15));  // ~500–3600 Hz
+  const rawTreble = bandEnergy(Math.floor(n * 0.15), Math.floor(n * 0.6)); // ~3600–14000 Hz
+
+  // RMS du signal temporel pour le volume global
+  let rms = 0;
+  for (let i = 0; i < timeData.length; i++) {
+    const v = (timeData[i] - 128) / 128;
+    rms += v * v;
+  }
+  rms = Math.sqrt(rms / timeData.length);
+
+  const s = sensitivity;
+  const smooth = (cur, target, up = 0.4, down = 0.08) =>
+    cur + (target - cur) * (target > cur ? up : down);
+
+  audio.level = smooth(audio.level, Math.min(1, rms * s));
+  audio.bass = smooth(audio.bass, Math.min(1, rawBass * s));
+  audio.mid = smooth(audio.mid, Math.min(1, rawMid * s));
+  audio.treble = smooth(audio.treble, Math.min(1, rawTreble * s * 1.5));
+
+  // Détection de transitoire : montée brutale du volume
+  const jump = audio.level - prevLevel;
+  if (jump > 0.07) audio.transient = Math.min(1, audio.transient + jump * 4);
+  audio.transient *= 0.92;
+  prevLevel = audio.level;
+
+  vuBar.style.width = (audio.level * 100).toFixed(1) + '%';
+}
+
+// ————————————————————————————— Canvas —————————————————————————————
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+let W, H, DPR;
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = canvas.width = innerWidth * DPR;
+  H = canvas.height = innerHeight * DPR;
+}
+addEventListener('resize', resize);
+resize();
+
+// ————————————————————— Mode 1 : Organique —————————————————————
+// Particules fluides façon plancton bioluminescent + ondes concentriques sur transitoires
+const particles = [];
+const ripples = [];
+const P_COUNT = 260;
+
+function initOrganic() {
+  particles.length = 0;
+  for (let i = 0; i < P_COUNT; i++) {
+    particles.push({
+      x: Math.random() * W, y: Math.random() * H,
+      a: Math.random() * Math.PI * 2,       // direction de dérive
+      r: 1 + Math.random() * 2.5,
+      phase: Math.random() * Math.PI * 2,
+      hue: 175 + Math.random() * 50,        // cyan → bleu-vert
+    });
+  }
+}
+
+function drawOrganic(t) {
+  ctx.fillStyle = 'rgba(1, 8, 14, 0.14)'; // fond persistant → traînées
+  ctx.fillRect(0, 0, W, H);
+
+  if (audio.transient > 0.25) {
+    ripples.push({ x: W * (0.2 + Math.random() * 0.6), y: H * (0.2 + Math.random() * 0.6), r: 0, life: 1, strength: audio.transient });
+  }
+
+  // Ondes concentriques (événements sonores)
+  ctx.lineWidth = 2 * DPR;
+  for (let i = ripples.length - 1; i >= 0; i--) {
+    const rp = ripples[i];
+    rp.r += (3 + rp.strength * 10) * DPR;
+    rp.life *= 0.96;
+    if (rp.life < 0.02) { ripples.splice(i, 1); continue; }
+    ctx.strokeStyle = `hsla(190, 90%, 70%, ${rp.life * 0.5})`;
+    ctx.beginPath();
+    ctx.arc(rp.x, rp.y, rp.r, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // Particules : vitesse portée par les graves, scintillement par les aigus
+  const drift = 0.3 + audio.bass * 4;
+  for (const p of particles) {
+    p.a += Math.sin(t * 0.0004 + p.phase) * 0.03;
+    p.x += Math.cos(p.a) * drift * DPR;
+    p.y += Math.sin(p.a) * drift * DPR + Math.sin(t * 0.001 + p.phase) * 0.3 * DPR;
+    if (p.x < -10) p.x = W + 10; if (p.x > W + 10) p.x = -10;
+    if (p.y < -10) p.y = H + 10; if (p.y > H + 10) p.y = -10;
+
+    const twinkle = 0.35 + audio.treble * Math.abs(Math.sin(t * 0.004 + p.phase)) * 0.9;
+    const size = p.r * (1 + audio.level * 2.2) * DPR;
+    const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, size * 4);
+    g.addColorStop(0, `hsla(${p.hue}, 95%, ${55 + audio.mid * 30}%, ${twinkle})`);
+    g.addColorStop(1, 'transparent');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, size * 4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// ————————————————————— Mode 2 : Spectre —————————————————————
+// Spectrogramme défilant + barres de fréquences miroir — esthétique data brute
+const specHistory = document.createElement('canvas');
+const specCtx = specHistory.getContext('2d');
+
+function drawSpectrum() {
+  ctx.fillStyle = '#02060a';
+  ctx.fillRect(0, 0, W, H);
+  if (!freqData) return;
+
+  // — Spectrogramme (moitié haute) : on décale l'historique d'1px vers la gauche
+  if (specHistory.width !== W || specHistory.height !== Math.floor(H / 2)) {
+    specHistory.width = W; specHistory.height = Math.floor(H / 2);
+  }
+  const sh = specHistory.height;
+  specCtx.drawImage(specHistory, -2, 0);
+  const usable = Math.floor(freqData.length * 0.6);
+  for (let y = 0; y < sh; y++) {
+    const bin = Math.floor(Math.pow(1 - y / sh, 2.2) * usable); // échelle ~log, graves en bas
+    const v = Math.min(1, (freqData[bin] / 255) * sensitivity * 0.6);
+    specCtx.fillStyle = v < 0.02 ? '#02060a' : `hsl(${200 - v * 160}, 90%, ${8 + v * 55}%)`;
+    specCtx.fillRect(W - 2, y, 2, 1);
+  }
+  ctx.drawImage(specHistory, 0, 0);
+
+  // — Barres miroir (moitié basse)
+  const bars = 96;
+  const bw = W / bars;
+  const baseY = H * 0.75;
+  for (let i = 0; i < bars; i++) {
+    const bin = Math.floor(Math.pow(i / bars, 1.8) * usable);
+    const v = Math.min(1, (freqData[bin] / 255) * sensitivity * 0.55);
+    const h = v * H * 0.22;
+    ctx.fillStyle = `hsl(${195 - v * 140}, 90%, ${35 + v * 35}%)`;
+    ctx.fillRect(i * bw + 1, baseY - h, bw - 2, h);
+    ctx.globalAlpha = 0.35;
+    ctx.fillRect(i * bw + 1, baseY, bw - 2, h * 0.6); // reflet
+    ctx.globalAlpha = 1;
+  }
+
+  // — Oscilloscope par-dessus la ligne médiane
+  ctx.strokeStyle = `rgba(140, 235, 255, ${0.25 + audio.level * 0.6})`;
+  ctx.lineWidth = 1.5 * DPR;
+  ctx.beginPath();
+  for (let i = 0; i < timeData.length; i += 4) {
+    const x = (i / timeData.length) * W;
+    const y = baseY + ((timeData[i] - 128) / 128) * H * 0.1 * sensitivity;
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+// ————————————————————— Mode 3 : Abstrait —————————————————————
+// Rosace génératrice : anneaux polygonaux déformés par le spectre, teinte pilotée par graves/aigus
+let rot = 0;
+
+function drawAbstract(t) {
+  ctx.fillStyle = 'rgba(2, 2, 8, 0.18)';
+  ctx.fillRect(0, 0, W, H);
+  if (!freqData) return;
+
+  const cx = W / 2, cy = H / 2;
+  rot += 0.002 + audio.bass * 0.03;
+  const baseHue = 220 + audio.bass * 120 - audio.treble * 60 + Math.sin(t * 0.0001) * 30;
+  const rings = 5;
+  const points = 180;
+  const maxR = Math.min(W, H) * (0.18 + audio.level * 0.28);
+
+  for (let ring = 0; ring < rings; ring++) {
+    const rBase = maxR * (0.4 + ring * 0.25);
+    ctx.strokeStyle = `hsla(${baseHue + ring * 14}, 85%, ${60 - ring * 6}%, ${0.55 - ring * 0.08})`;
+    ctx.lineWidth = (2.5 - ring * 0.35) * DPR;
+    ctx.beginPath();
+    for (let i = 0; i <= points; i++) {
+      const ang = (i / points) * Math.PI * 2 + rot * (ring % 2 ? 1 : -1);
+      const bin = Math.floor((i / points) * freqData.length * 0.5);
+      const deform = (freqData[bin] / 255) * sensitivity * maxR * 0.35;
+      const r = rBase + deform * Math.sin(ang * (3 + ring) + t * 0.001);
+      const x = cx + Math.cos(ang) * r;
+      const y = cy + Math.sin(ang) * r;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.stroke();
+  }
+
+  // Flash central sur transitoire
+  if (audio.transient > 0.1) {
+    const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, maxR * 1.6);
+    g.addColorStop(0, `hsla(${baseHue + 40}, 95%, 75%, ${audio.transient * 0.4})`);
+    g.addColorStop(1, 'transparent');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+  }
+}
+
+// ————————————————————— Mode 4 : Têtards —————————————————————
+// Banc de têtards : nage portée par les graves, un son fort effraie le banc
+const tadpoles = [];
+let fright = null, frightTime = 0;
+
+function initTadpoles() {
+  tadpoles.length = 0;
+  for (let i = 0; i < 70; i++) {
+    tadpoles.push({
+      x: Math.random() * W, y: Math.random() * H,
+      a: Math.random() * Math.PI * 2,
+      s: (3.5 + Math.random() * 4) * DPR,   // taille de la tête
+      phase: Math.random() * Math.PI * 2,
+      dart: 0,                              // impulsion de fuite
+      wob: 0.6 + Math.random() * 0.8,       // personnalité de nage
+    });
+  }
+}
+
+function drawTadpoles(t) {
+  ctx.fillStyle = 'rgba(4, 14, 10, 0.22)'; // fond de mare, traînées
+  ctx.fillRect(0, 0, W, H);
+
+  // Un événement sonore effraie le banc : fuite depuis un point aléatoire
+  if (audio.transient > 0.3 && t - frightTime > 400) {
+    fright = { x: Math.random() * W, y: Math.random() * H };
+    frightTime = t;
+    for (const tp of tadpoles) tp.dart = 0.8 + audio.transient;
+  }
+
+  // Reflets de surface pilotés par les aigus
+  if (audio.treble > 0.25) {
+    ctx.fillStyle = `hsla(160, 60%, 75%, ${audio.treble * 0.07})`;
+    for (let i = 0; i < 3; i++) {
+      ctx.beginPath();
+      ctx.ellipse(Math.random() * W, Math.random() * H, 30 * DPR, 6 * DPR, Math.random(), 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  for (const tp of tadpoles) {
+    const wiggle = t * (0.006 + audio.level * 0.02) * tp.wob + tp.phase;
+    tp.a += Math.sin(t * 0.0008 * tp.wob + tp.phase) * 0.04;
+
+    // Fuite : s'orienter à l'opposé du point d'effroi
+    if (tp.dart > 0.02 && fright) {
+      const away = Math.atan2(tp.y - fright.y, tp.x - fright.x);
+      let d = away - tp.a;
+      while (d > Math.PI) d -= Math.PI * 2;
+      while (d < -Math.PI) d += Math.PI * 2;
+      tp.a += d * 0.15 * tp.dart;
+      tp.dart *= 0.94;
+    }
+
+    const speed = (0.5 + audio.bass * 3.5 + tp.dart * 6) * DPR;
+    tp.x += Math.cos(tp.a) * speed;
+    tp.y += Math.sin(tp.a) * speed;
+    const m = 30 * DPR;
+    if (tp.x < -m) tp.x = W + m; if (tp.x > W + m) tp.x = -m;
+    if (tp.y < -m) tp.y = H + m; if (tp.y > H + m) tp.y = -m;
+
+    // — Dessin —
+    ctx.save();
+    ctx.translate(tp.x, tp.y);
+    ctx.rotate(tp.a);
+    const s = tp.s * (1 + audio.level * 0.35);
+
+    // Queue : perles sinusoïdales qui s'affinent
+    ctx.fillStyle = `hsla(95, 45%, ${45 + audio.mid * 25}%, 0.85)`;
+    for (let i = 1; i <= 8; i++) {
+      const tx = -s * 0.5 - i * s * 0.5;
+      const ty = Math.sin(wiggle + i * 0.65) * s * 0.45 * (i / 8) * (1 + tp.dart * 0.6);
+      ctx.beginPath();
+      ctx.arc(tx, ty, s * 0.42 * (1 - i / 9), 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Tête
+    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, s * 1.6);
+    g.addColorStop(0, `hsla(90, 50%, ${55 + audio.mid * 25}%, 0.95)`);
+    g.addColorStop(1, 'hsla(100, 40%, 25%, 0.6)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, s * 1.15, s * 0.85, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Yeux
+    ctx.fillStyle = 'rgba(10, 20, 10, 0.9)';
+    ctx.beginPath();
+    ctx.arc(s * 0.45, -s * 0.35, s * 0.16, 0, Math.PI * 2);
+    ctx.arc(s * 0.45, s * 0.35, s * 0.16, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+}
+
+// ————————————————————— Mode 5 : Oiseaux —————————————————————
+// Les 9 espèces du site, chacune avec sa silhouette et son comportement :
+// voiliers qui traversent, faucon en vol stationnaire, nageurs qui plongent aux sons forts
+const SPECIES = [
+  { name: 'Canard colvert',    kind: 'flyer',   size: 1.0,  flap: 2.4, neck: 0.5, tint: 130, glide: 0 },
+  { name: 'Foulque macroule',  kind: 'swimmer', size: 0.9,  crest: false },
+  { name: 'Grand cormoran',    kind: 'flyer',   size: 1.25, flap: 1.7, neck: 1.3, tint: 215, glide: 0.2 },
+  { name: 'Héron cendré',      kind: 'flyer',   size: 1.7,  flap: 0.8, neck: 0.7, legs: true, tint: 205, glide: 0.15 },
+  { name: 'Milan royal',       kind: 'flyer',   size: 1.45, flap: 0.6, neck: 0.3, forked: true, tint: 20, glide: 0.65 },
+  { name: 'Buse variable',     kind: 'flyer',   size: 1.3,  flap: 0.7, neck: 0.3, broad: true, tint: 30, glide: 0.7 },
+  { name: 'Faucon crécerelle', kind: 'hover',   size: 0.8,  flap: 3.5, neck: 0.3, tint: 25 },
+  { name: 'Grèbe huppé',       kind: 'swimmer', size: 0.95, crest: true },
+  { name: 'Grand corbeau',     kind: 'flyer',   size: 1.15, flap: 1.3, neck: 0.4, tint: 240, glide: 0.1 },
+];
+const FLYERS = SPECIES.filter(s => s.kind === 'flyer');
+const birds = [];
+const birdRipples = [];
+let lastBirdT = 0, lastSpawnT = 0;
+
+function spawnFlyer(sp) {
+  sp = sp || FLYERS[Math.floor(Math.random() * FLYERS.length)];
+  const dir = Math.random() < 0.5 ? 1 : -1;
+  birds.push({
+    sp, kind: 'flyer', dir,
+    x: dir === 1 ? -90 * DPR : W + 90 * DPR,
+    y: H * (0.1 + Math.random() * 0.45),
+    wing: Math.random() * 10, flapAmp: 1,
+    phase: Math.random() * 10,
+  });
+}
+
+function initBirds() {
+  birds.length = 0;
+  birdRipples.length = 0;
+  for (const name of ['Foulque macroule', 'Grèbe huppé']) {
+    birds.push({
+      sp: SPECIES.find(s => s.name === name), kind: 'swimmer',
+      dir: Math.random() < 0.5 ? 1 : -1,
+      x: W * (0.15 + Math.random() * 0.7),
+      diveY: 0, state: 'swim', diveT: 0,
+      phase: Math.random() * 10,
+    });
+  }
+  birds.push({
+    sp: SPECIES.find(s => s.name === 'Faucon crécerelle'), kind: 'hover',
+    dir: 1, hx: W * 0.72, hy: H * 0.22, x: W * 0.72, y: H * 0.22,
+    wing: 0, flapAmp: 1, state: 'hover', vy: 0, phase: 0,
+  });
+  for (let i = 0; i < 3; i++) spawnFlyer();
+}
+
+// Aile : triangle balayé, f ∈ [-1,1] = angle du battement
+function wingShape(s, f, broad) {
+  const spanX = broad ? 1.2 : 0.9;
+  const tipY = -s * 2.4 * f - s * 0.25;
+  ctx.beginPath();
+  ctx.moveTo(s * 0.5, -s * 0.2);
+  ctx.quadraticCurveTo(s * spanX, tipY * 0.6, s * 0.2, tipY);
+  ctx.quadraticCurveTo(-s * (broad ? 1.4 : 1.0), tipY * 0.35, -s * 0.9, -s * 0.1);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawFlyer(b, t) {
+  const sp = b.sp;
+  const s = sp.size * 7 * DPR * (1 + audio.level * 0.2);
+  const flap = Math.sin(b.wing) * b.flapAmp;
+  const tint = sp.tint;
+  const body = `hsla(${tint}, 30%, ${72 + audio.mid * 15}%, 0.95)`;
+  const dark = `hsla(${tint}, 30%, 45%, 0.9)`;
+
+  ctx.save();
+  ctx.translate(b.x, b.y);
+  ctx.scale(b.dir, 1);
+
+  // Aile arrière
+  ctx.fillStyle = dark;
+  wingShape(s, -flap * 0.85, sp.broad);
+
+  // Queue (fourchue pour le Milan royal)
+  ctx.fillStyle = body;
+  ctx.beginPath();
+  if (sp.forked) {
+    ctx.moveTo(-s * 1.6, 0);
+    ctx.lineTo(-s * 3.1, -s * 0.75);
+    ctx.lineTo(-s * 2.3, 0);
+    ctx.lineTo(-s * 3.1, s * 0.75);
+  } else {
+    ctx.moveTo(-s * 1.6, -s * 0.3);
+    ctx.lineTo(-s * 2.8, -s * 0.5);
+    ctx.lineTo(-s * 2.8, s * 0.5);
+    ctx.lineTo(-s * 1.6, s * 0.3);
+  }
+  ctx.closePath();
+  ctx.fill();
+
+  // Corps
+  ctx.beginPath();
+  ctx.ellipse(0, 0, s * 1.9, s * 0.6, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Cou + tête (le héron vole cou replié)
+  const nl = sp.neck;
+  const hx = s * (1.7 + nl * 1.6), hy = -s * (0.3 + nl * 0.5);
+  ctx.strokeStyle = body;
+  ctx.lineWidth = s * 0.45;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(s * 1.4, -s * 0.15);
+  if (sp.legs) ctx.quadraticCurveTo(s * 2.2, s * 0.5, hx, hy);
+  else ctx.lineTo(hx, hy);
+  ctx.stroke();
+  ctx.fillStyle = sp.name === 'Canard colvert' ? 'hsl(150, 65%, 42%)' : body;
+  ctx.beginPath();
+  ctx.arc(hx, hy, s * 0.42, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Bec (long pour héron et cormoran)
+  ctx.fillStyle = dark;
+  ctx.beginPath();
+  ctx.moveTo(hx + s * 0.3, hy - s * 0.12);
+  ctx.lineTo(hx + s * (sp.legs || nl > 1 ? 1.2 : 0.75), hy);
+  ctx.lineTo(hx + s * 0.3, hy + s * 0.12);
+  ctx.closePath();
+  ctx.fill();
+
+  // Pattes traînantes du héron
+  if (sp.legs) {
+    ctx.strokeStyle = dark;
+    ctx.lineWidth = s * 0.12;
+    ctx.beginPath();
+    ctx.moveTo(-s * 1.4, s * 0.3); ctx.lineTo(-s * 3.3, s * 0.75);
+    ctx.moveTo(-s * 1.3, s * 0.4); ctx.lineTo(-s * 3.2, s * 0.95);
+    ctx.stroke();
+  }
+
+  // Aile avant
+  ctx.fillStyle = body;
+  wingShape(s, flap, sp.broad);
+  ctx.restore();
+
+  // Nom de l'espèce
+  ctx.fillStyle = 'rgba(180, 220, 240, 0.32)';
+  ctx.font = `${11 * DPR}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.fillText(sp.name, b.x, b.y + s * 4);
+}
+
+function drawSwimmer(b, t, yW) {
+  const sp = b.sp;
+  const s = sp.size * 8 * DPR;
+  const bob = Math.sin(t * 0.002 + b.phase) * 3 * DPR * (1 + audio.mid * 2);
+  const y = yW + bob - s * 0.35 + b.diveY;
+
+  ctx.save();
+  ctx.globalAlpha = Math.max(0, 1 - b.diveY / (s * 2));
+  ctx.translate(b.x, y);
+  ctx.scale(b.dir, 1);
+  // Grèbe : teinte chaude huppée / Foulque : gris ardoise à plaque blanche
+  const body = sp.crest ? 'hsla(30, 35%, 72%, 0.95)' : 'hsla(220, 12%, 62%, 0.95)';
+  const dark = sp.crest ? 'hsla(20, 40%, 35%, 0.95)' : 'hsla(220, 15%, 35%, 0.95)';
+
+  ctx.fillStyle = body;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, s * 1.4, s * 0.55, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Cou + tête dressés
+  const hx = s * 1.1, hy = -s * 1.5;
+  ctx.strokeStyle = body;
+  ctx.lineWidth = s * 0.32;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(s * 0.8, -s * 0.2);
+  ctx.quadraticCurveTo(s * 1.25, -s * 0.8, hx, hy);
+  ctx.stroke();
+  ctx.fillStyle = body;
+  ctx.beginPath();
+  ctx.arc(hx, hy, s * 0.34, 0, Math.PI * 2);
+  ctx.fill();
+
+  if (sp.crest) { // huppe du grèbe
+    ctx.fillStyle = dark;
+    for (const [dx, dy] of [[-0.15, -0.5], [0.05, -0.55], [0.25, -0.45]]) {
+      ctx.beginPath();
+      ctx.moveTo(hx + s * (dx - 0.08), hy + s * (dy + 0.25));
+      ctx.lineTo(hx + s * dx, hy + s * dy);
+      ctx.lineTo(hx + s * (dx + 0.08), hy + s * (dy + 0.25));
+      ctx.closePath();
+      ctx.fill();
+    }
+  } else { // plaque frontale blanche de la foulque
+    ctx.fillStyle = 'rgba(245, 248, 250, 0.95)';
+    ctx.beginPath();
+    ctx.ellipse(hx + s * 0.18, hy, s * 0.14, s * 0.26, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // Bec
+  ctx.fillStyle = dark;
+  ctx.beginPath();
+  ctx.moveTo(hx + s * 0.25, hy - s * 0.09);
+  ctx.lineTo(hx + s * 0.7, hy + s * 0.02);
+  ctx.lineTo(hx + s * 0.25, hy + s * 0.11);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+
+  if (b.diveY === 0) {
+    ctx.fillStyle = 'rgba(180, 220, 240, 0.32)';
+    ctx.font = `${11 * DPR}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.fillText(sp.name, b.x, yW + 24 * DPR);
+  }
+}
+
+function drawBirds(t) {
+  const dt = Math.min(50, t - lastBirdT || 16);
+  lastBirdT = t;
+  const yW = H * 0.8;
+
+  ctx.fillStyle = 'rgba(2, 6, 12, 0.28)'; // ciel nocturne
+  ctx.fillRect(0, 0, W, H);
+
+  // Plan d'eau
+  const grad = ctx.createLinearGradient(0, yW, 0, H);
+  grad.addColorStop(0, 'rgba(10, 32, 48, 0.5)');
+  grad.addColorStop(1, 'rgba(2, 8, 14, 0.85)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, yW, W, H - yW);
+
+  // Ligne de surface, agitée par le spectre
+  ctx.strokeStyle = `rgba(120, 200, 230, ${0.2 + audio.level * 0.5})`;
+  ctx.lineWidth = 1.5 * DPR;
+  ctx.beginPath();
+  for (let x = 0; x <= W; x += 8 * DPR) {
+    const bin = Math.floor((x / W) * 180);
+    const dy = Math.sin(x * 0.01 + t * 0.002) * 2.5 * DPR
+      + (freqData ? (freqData[bin] / 255) * sensitivity * 6 * DPR * Math.sin(x * 0.05 + t * 0.004) : 0);
+    x === 0 ? ctx.moveTo(x, yW + dy) : ctx.lineTo(x, yW + dy);
+  }
+  ctx.stroke();
+
+  // Ronds dans l'eau (plongeons)
+  ctx.lineWidth = 1.5 * DPR;
+  for (let i = birdRipples.length - 1; i >= 0; i--) {
+    const rp = birdRipples[i];
+    rp.r += 2.5 * DPR;
+    rp.life *= 0.95;
+    if (rp.life < 0.03) { birdRipples.splice(i, 1); continue; }
+    ctx.strokeStyle = `rgba(150, 220, 245, ${rp.life * 0.6})`;
+    ctx.beginPath();
+    ctx.ellipse(rp.x, rp.y, rp.r, rp.r * 0.25, 0, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // Un événement sonore fait décoller un nouvel oiseau
+  if (audio.transient > 0.35 && t - lastSpawnT > 900 && birds.filter(b => b.kind === 'flyer').length < 8) {
+    spawnFlyer();
+    lastSpawnT = t;
+  }
+
+  for (let i = birds.length - 1; i >= 0; i--) {
+    const b = birds[i];
+
+    if (b.kind === 'flyer') {
+      const sp = b.sp;
+      // Alternance battement / plané pour les rapaces
+      const gliding = Math.sin(t * 0.0006 + b.phase) < sp.glide * 2 - 1;
+      b.flapAmp += ((gliding ? 0.15 : 1) - b.flapAmp) * 0.05;
+      b.wing += dt * (0.006 + audio.bass * 0.012) * sp.flap * (gliding ? 0.3 : 1);
+      b.x += b.dir * (2.2 - sp.size * 0.5) * (1 + audio.level * 2) * DPR * (dt / 16);
+      b.y += Math.sin(t * 0.001 + b.phase) * 0.4 * DPR;
+      b.y = Math.max(H * 0.06, Math.min(yW - 60 * DPR, b.y));
+      if (b.x < -120 * DPR || b.x > W + 120 * DPR) {
+        birds.splice(i, 1);
+        if (birds.filter(x => x.kind === 'flyer').length < 3) spawnFlyer();
+        continue;
+      }
+      drawFlyer(b, t);
+
+    } else if (b.kind === 'hover') {
+      // Faucon crécerelle : vol en Saint-Esprit, pique sur les sons très forts
+      b.wing += dt * (0.006 + audio.bass * 0.012) * b.sp.flap;
+      if (b.state === 'hover') {
+        b.x = b.hx + Math.sin(t * 0.0013 + b.phase) * 30 * DPR;
+        b.y += (b.hy + Math.sin(t * 0.003) * 6 * DPR - b.y) * 0.1;
+        if (audio.transient > 0.55) { b.state = 'stoop'; b.vy = 2 * DPR; }
+      } else if (b.state === 'stoop') {
+        b.vy += 0.6 * DPR;
+        b.y += b.vy;
+        if (b.y > yW - 80 * DPR) { b.state = 'climb'; b.hx = W * (0.2 + Math.random() * 0.6); }
+      } else { // climb
+        b.y -= 4 * DPR;
+        b.x += (b.hx - b.x) * 0.03;
+        if (b.y <= b.hy) b.state = 'hover';
+      }
+      drawFlyer(b, t);
+
+    } else { // swimmer
+      if (b.state === 'swim') {
+        b.x += b.dir * (0.25 + audio.level * 1.2) * DPR;
+        if (b.x < W * 0.06 || b.x > W * 0.94) b.dir *= -1;
+        if (audio.transient > 0.4 && Math.random() < 0.5) {
+          b.state = 'dive'; b.diveT = t;
+          birdRipples.push({ x: b.x, y: yW, r: 5 * DPR, life: 1 });
+        }
+      } else if (b.state === 'dive') {
+        b.diveY = Math.min(b.diveY + 1.5 * DPR, b.sp.size * 24 * DPR);
+        if (t - b.diveT > 2200) {
+          b.state = 'rise';
+          b.x = W * (0.1 + Math.random() * 0.8); // refait surface ailleurs
+        }
+      } else { // rise
+        b.diveY -= 2 * DPR;
+        if (b.diveY <= 0) {
+          b.diveY = 0; b.state = 'swim';
+          birdRipples.push({ x: b.x, y: yW, r: 5 * DPR, life: 0.8 });
+        }
+      }
+      drawSwimmer(b, t, yW);
+    }
+  }
+}
+
+// ————————————————————— Mode 6 : Images —————————————————————
+// Toutes les images déposées dans img/ (image1.png, image2.jpg…) flottent
+// et réagissent au son : taille avec le volume, sursaut sur les sons forts
+const loadedImages = [];
+const sprites = [];
+let imagesLoadStarted = false;
+
+function loadImagesOnce() {
+  if (imagesLoadStarted) return;
+  imagesLoadStarted = true;
+  for (let i = 1; i <= 8; i++) {
+    for (const ext of ['png', 'jpg', 'jpeg', 'webp', 'gif']) {
+      const im = new Image();
+      im.onload = () => loadedImages.push(im);
+      im.src = `img/image${i}.${ext}`;
+    }
+  }
+}
+
+function initImages() {
+  loadImagesOnce();
+  sprites.length = 0;
+}
+
+function drawImages(t) {
+  ctx.fillStyle = 'rgba(2, 4, 10, 0.3)';
+  ctx.fillRect(0, 0, W, H);
+
+  // Message d'aide tant qu'aucune image n'est trouvée
+  if (!loadedImages.length) {
+    ctx.fillStyle = 'rgba(160, 210, 235, 0.7)';
+    ctx.font = `${16 * DPR}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.fillText("Dépose des images dans le dossier « img/ »", W / 2, H / 2 - 14 * DPR);
+    ctx.fillText("nommées image1.png, image2.jpg, image3.png…", W / 2, H / 2 + 14 * DPR);
+    return;
+  }
+
+  // 3 exemplaires de chaque image (12 max), créés au fil des chargements
+  while (sprites.length < Math.min(loadedImages.length * 3, 12)) {
+    const im = loadedImages[sprites.length % loadedImages.length];
+    sprites.push({
+      im,
+      x: Math.random() * W, y: Math.random() * H,
+      vx: (Math.random() - 0.5) * 1.6 * DPR, vy: (Math.random() - 0.5) * 1.6 * DPR,
+      rot: (Math.random() - 0.5) * 0.4, vr: (Math.random() - 0.5) * 0.01,
+      phase: Math.random() * 10,
+      pop: 0, // sursaut sur événement sonore
+    });
+  }
+
+  // Un son fort fait sursauter une image au hasard
+  if (audio.transient > 0.35) {
+    const sp = sprites[Math.floor(Math.random() * sprites.length)];
+    if (sp) sp.pop = Math.min(1.6, sp.pop + audio.transient);
+  }
+
+  for (const sp of sprites) {
+    // Dérive + rebond sur les bords, vitesse portée par les graves
+    const boost = 1 + audio.bass * 3 + sp.pop * 2;
+    sp.x += sp.vx * boost;
+    sp.y += sp.vy * boost;
+    if (sp.x < 0 || sp.x > W) sp.vx *= -1;
+    if (sp.y < 0 || sp.y > H) sp.vy *= -1;
+    sp.x = Math.max(0, Math.min(W, sp.x));
+    sp.y = Math.max(0, Math.min(H, sp.y));
+    sp.rot += sp.vr * (1 + audio.treble * 6) + Math.sin(t * 0.001 + sp.phase) * 0.002;
+    sp.pop *= 0.93;
+
+    // Taille : base + pulsation avec le volume + sursaut
+    const base = Math.min(W, H) * 0.14;
+    const scale = (base / Math.max(sp.im.width, sp.im.height))
+      * (0.8 + audio.level * 0.9 + sp.pop * 1.4 + Math.sin(t * 0.002 + sp.phase) * 0.08);
+    const w = sp.im.width * scale, h = sp.im.height * scale;
+
+    ctx.save();
+    ctx.translate(sp.x, sp.y);
+    ctx.rotate(sp.rot);
+    // Halo lumineux sur sursaut
+    if (sp.pop > 0.1) {
+      ctx.shadowColor = `hsla(${(t * 0.1) % 360}, 90%, 65%, ${sp.pop})`;
+      ctx.shadowBlur = 40 * sp.pop * DPR;
+    }
+    ctx.drawImage(sp.im, -w / 2, -h / 2, w, h);
+    ctx.restore();
+  }
+}
+
+// ————————————————————————————— Boucle & UI —————————————————————————————
+let mode = 'organic';
+const vuBar = document.querySelector('#vu div');
+
+function loop(t) {
+  updateAudio();
+  if (mode === 'organic') drawOrganic(t);
+  else if (mode === 'spectrum') drawSpectrum();
+  else if (mode === 'tadpoles') drawTadpoles(t);
+  else if (mode === 'birds') drawBirds(t);
+  else if (mode === 'images') drawImages(t);
+  else drawAbstract(t);
+  requestAnimationFrame(loop);
+}
+
+function setMode(m) {
+  mode = m;
+  document.querySelectorAll('#hud .modes button').forEach(b =>
+    b.classList.toggle('active', b.dataset.mode === m));
+  if (m === 'organic') initOrganic();
+  if (m === 'tadpoles') initTadpoles();
+  if (m === 'birds') initBirds();
+  if (m === 'images') initImages();
+}
+
+document.getElementById('startBtn').addEventListener('click', async () => {
+  try {
+    await startAudio();
+  } catch (e) {
+    alert("Impossible d'accéder au micro : " + e.message);
+    return;
+  }
+  document.getElementById('overlay').classList.add('hidden');
+  document.body.classList.add('started', 'show-hud');
+  setTimeout(() => document.body.classList.remove('show-hud'), 4000);
+  initOrganic();
+  requestAnimationFrame(loop);
+});
+
+document.querySelectorAll('#hud .modes button').forEach(b =>
+  b.addEventListener('click', () => setMode(b.dataset.mode)));
+
+document.getElementById('gain').addEventListener('input', e =>
+  sensitivity = parseFloat(e.target.value));
+
+addEventListener('keydown', e => {
+  if (e.key === '1') setMode('organic');
+  if (e.key === '2') setMode('spectrum');
+  if (e.key === '3') setMode('abstract');
+  if (e.key === '4') setMode('tadpoles');
+  if (e.key === '5') setMode('birds');
+  if (e.key === '6') setMode('images');
+  if (e.key.toLowerCase() === 'f') {
+    document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+  }
+});
+</script>
+</body>
+</html>
