@@ -33,12 +33,12 @@
   }
   body.started #hud:hover, body.started.show-hud #hud { opacity: 1; }
   #hud .modes { display: flex; gap: 8px; }
-  #hud button {
-    padding: 6px 14px; font-size: 11px; letter-spacing: .1em; cursor: pointer;
+  #hud button, #hud a.nav {
+    padding: 6px 14px; font-size: 11px; letter-spacing: .1em; cursor: pointer; text-decoration: none;
     background: #ffffff10; color: #9fc6d8; border: 1px solid #ffffff22; border-radius: 20px;
     transition: all .2s;
   }
-  #hud button.active, #hud button:hover { background: #7fd4f025; color: #cfeeff; border-color: #7fd4f0aa; }
+  #hud button.active, #hud button:hover, #hud a.nav:hover { background: #7fd4f025; color: #cfeeff; border-color: #7fd4f0aa; }
   #hud label { display: flex; align-items: center; gap: 8px; }
   #hud input[type=range] { width: 110px; accent-color: #7fd4f0; }
   #vu { width: 90px; height: 6px; background: #ffffff15; border-radius: 3px; overflow: hidden; }
@@ -78,6 +78,7 @@
     <button data-mode="birds">Oiseaux</button>
     <button data-mode="images">Images</button>
   </div>
+  <a class="nav" href="simulation.html" target="_blank">Carte Grandval ↗</a>
   <label>Sensibilité <input type="range" id="gain" min="0.5" max="8" step="0.1" value="2.5"></label>
   <div id="vu"><div></div></div>
   <span style="margin-left:auto">1–6 : styles · F : plein écran</span>

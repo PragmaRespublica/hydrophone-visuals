@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tutto Blue — Lac de Grandval · Simulation</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; font-family: -apple-system, "Helvetica Neue", sans-serif; }
+
+  #map { position: fixed; inset: 0; z-index: 1; background: #010812; }
+  /* Teinte "tutto blue" appliquée aux tuiles */
+  .leaflet-tile-pane { filter: brightness(.55) saturate(.55) hue-rotate(-10deg); }
+  #tint { position: fixed; inset: 0; z-index: 2; pointer-events: none; background: rgba(6, 28, 52, 0.35); }
+  #fx { position: fixed; inset: 0; z-index: 3; pointer-events: none; }
+
+  #title {
+    position: fixed; top: 18px; left: 22px; z-index: 5; color: #cfe8f5; pointer-events: none;
+  }
+  #title h1 { font-weight: 200; font-size: 1.15rem; letter-spacing: .35em; text-transform: uppercase; color: #7fd4f0; }
+  #title p { font-size: 11px; letter-spacing: .15em; opacity: .55; margin-top: 4px; }
+
+  #hud {
+    position: fixed; bottom: 0; left: 0; right: 0; z-index: 5;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; padding: 14px 20px;
+    background: linear-gradient(transparent, #000c);
+    color: #9fc6d8; font-size: 12px;
+  }
+  #hud button, #hud a {
+    padding: 6px 14px; font-size: 11px; letter-spacing: .1em; cursor: pointer; text-decoration: none; white-space: nowrap;
+    background: #ffffff10; color: #9fc6d8; border: 1px solid #ffffff22; border-radius: 20px;
+    transition: all .2s;
+  }
+  #hud button.active, #hud button:hover, #hud a:hover { background: #7fd4f025; color: #cfeeff; border-color: #7fd4f0aa; }
+  #hud label { display: flex; align-items: center; gap: 8px; }
+  #hud input[type=range] { width: 110px; accent-color: #7fd4f0; }
+  #hud .hint { margin-left: auto; color: #ffffff55; letter-spacing: .1em; }
+
+  /* Marqueurs hydrophones (poignées déplaçables, le halo est dessiné sur le canvas) */
+  .hydro-icon { position: relative; }
+  .hydro-icon .dot {
+    position: absolute; inset: 0; border-radius: 50%;
+    background: #0b2231; border: 1.5px solid #7fd4f0;
+    box-shadow: 0 0 12px #7fd4f088, inset 0 0 6px #7fd4f055;
+  }
+  .hydro-icon .tag {
+    position: absolute; top: -20px; left: 50%; transform: translateX(-50%);
+    color: #aee6fa; font-size: 10px; letter-spacing: .2em; text-shadow: 0 0 6px #000;
+  }
+  .leaflet-marker-draggable { cursor: grab; }
+
+  .garabit-tip {
+    background: #0b2231ee; color: #cfeeff; border: 1px solid #7fd4f0aa; border-radius: 12px;
+    font-size: 11px; letter-spacing: .08em; box-shadow: 0 0 12px #7fd4f044;
+  }
+  .garabit-tip::before { display: none; }
+
+  .leaflet-control-attribution { background: #000a !important; color: #ffffff55 !important; font-size: 9px !important; }
+  .leaflet-control-attribution a { color: #7fd4f088 !important; }
+  .leaflet-control-zoom a { background: #0b2231 !important; color: #9fc6d8 !important; border-color: #ffffff22 !important; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="tint"></div>
+<canvas id="fx"></canvas>
+
+<div id="title">
+  <h1>Tutto Blue</h1>
+  <p>LAC DE GRANDVAL — ÉCOUTE SUBAQUATIQUE · SIMULATION</p>
+</div>
+
+<div id="hud">
+  <button id="playBtn" class="active">❚❚ Pause</button>
+  <label>Densité <input type="range" id="density" min="1" max="10" step="1" value="4"></label>
+  <button id="garabitBtn">Base de Garabit</button>
+  <button id="fitBtn">Tout le lac</button>
+  <button id="baseBtn">Satellite / Nuit</button>
+  <a href="index.html" target="_blank">Visuels micro ↗</a>
+  <span class="hint" style="white-space:nowrap">clique dans le lac pour émettre un son · glisse H1–H3</span>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="grandval-lake.js"></script>
+<script>
+// ————————————————————————————— Carte —————————————————————————————
+const SPEED_OF_SOUND = 1480; // m/s en eau douce — pour les Δt affichés
+
+const map = L.map('map', { zoomControl: false, attributionControl: true });
+L.control.zoom({ position: 'topright' }).addTo(map);
+
+const baseSat = L.tileLayer(
+  'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+  { maxZoom: 18, attribution: 'Imagerie © Esri · Contour du lac © OpenStreetMap (ODbL)' });
+const baseDark = L.tileLayer(
+  'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+  { maxZoom: 19, attribution: '© CARTO © OpenStreetMap (ODbL)' });
+let satActive = true;
+baseSat.addTo(map);
+
+const lakeLayer = L.polygon(GRANDVAL_POLYGON, {
+  color: '#7fd4f0', weight: 1.5, opacity: .75,
+  fillColor: '#1d6f9e', fillOpacity: .28,
+}).addTo(map);
+map.fitBounds(lakeLayer.getBounds(), { padding: [40, 40] });
+
+// Base nautique de Garabit (position OSM)
+const GARABIT = L.latLng(44.97345, 3.16179);
+L.circleMarker(GARABIT, { radius: 5, color: '#e8f7ff', weight: 1.5, fillColor: '#7fd4f0', fillOpacity: .6 })
+  .addTo(map)
+  .bindTooltip('Base nautique de Garabit', {
+    permanent: false, direction: 'top', offset: [0, -6],
+    className: 'garabit-tip',
+  });
+
+// ————————————————————————— Géométrie lac ——————————————————————————
+const bounds = lakeLayer.getBounds();
+
+function inLake(lat, lng) { // ray casting sur le polygone simplifié
+  let inside = false;
+  const poly = GRANDVAL_POLYGON;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [yi, xi] = poly[i], [yj, xj] = poly[j];
+    if ((yi > lat) !== (yj > lat) && lng < (xj - xi) * (lat - yi) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+function randomLakePoint() {
+  for (let k = 0; k < 200; k++) {
+    const lat = bounds.getSouth() + Math.random() * (bounds.getNorth() - bounds.getSouth());
+    const lng = bounds.getWest() + Math.random() * (bounds.getEast() - bounds.getWest());
+    if (inLake(lat, lng)) return L.latLng(lat, lng);
+  }
+  return bounds.getCenter();
+}
+
+function haversine(a, b) { // distance en mètres
+  const R = 6371000, rad = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * rad, dLng = (b.lng - a.lng) * rad;
+  const s = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+// ————————————————————————— Hydrophones ————————————————————————————
+// 3 points intérieurs bien écartés : un tirage, puis deux maximisations de distance
+function spreadPoints(n) {
+  const pool = Array.from({ length: 250 }, randomLakePoint);
+  const pts = [pool[0]];
+  while (pts.length < n) {
+    let best = null, bestD = -1;
+    for (const p of pool) {
+      const d = Math.min(...pts.map(q => haversine(p, q)));
+      if (d > bestD) { bestD = d; best = p; }
+    }
+    pts.push(best);
+  }
+  return pts;
+}
+
+const hydros = spreadPoints(3).map((ll, i) => {
+  const icon = L.divIcon({
+    className: 'hydro-icon', iconSize: [14, 14], iconAnchor: [7, 7],
+    html: `<div class="dot"></div><div class="tag">H${i + 1}</div>`,
+  });
+  const marker = L.marker(ll, { icon, draggable: true, title: `Hydrophone H${i + 1}` }).addTo(map);
+  return { marker, flash: 0 };
+});
+
+// ————————————————————————— Événements sonores —————————————————————
+const LABELS = ['carpe ?', 'silure', 'toc toc !', 'branche immergée', 'bulles', 'sandre',
+                'écrevisse', 'moteur lointain', 'banc de gardons', 'inconnu…'];
+
+let playing = true;
+let animT = 0;          // horloge de la simulation (s), gelée en pause
+let nextSpawn = 1.5;
+const events = [];
+
+function spawnEvent(ll) {
+  const src = ll || randomLakePoint();
+  const dists = hydros.map(h => haversine(src, h.marker.getLatLng()));
+  const dMin = Math.min(...dists), dMax = Math.max(...dists);
+  // arrivées étalées sur ~2 s pour la dramaturgie, Δt réels affichés à côté
+  const arrivals = dists.map(d => 0.35 + 1.8 * (dMax > 0 ? d / dMax : 1));
+  events.push({
+    src, dists, arrivals, t0: animT,
+    label: LABELS[Math.floor(Math.random() * LABELS.length)],
+    dtMs: dists.map(d => (d - dMin) / SPEED_OF_SOUND * 1000),
+    end: Math.max(...arrivals) + 5.5,
+  });
+  if (events.length > 8) events.shift();
+}
+
+map.on('click', e => { if (inLake(e.latlng.lat, e.latlng.lng)) { spawnEvent(e.latlng); } });
+
+// ————————————————————————— Particules ambiantes ———————————————————
+const motes = Array.from({ length: 90 }, () => ({
+  ll: randomLakePoint(), phase: Math.random() * Math.PI * 2, speed: .3 + Math.random() * .7,
+}));
+
+// ————————————————————————— Rendu canvas ———————————————————————————
+const canvas = document.getElementById('fx');
+const ctx = canvas.getContext('2d');
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = innerWidth * dpr; canvas.height = innerHeight * dpr;
+  canvas.style.width = innerWidth + 'px'; canvas.style.height = innerHeight + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+resize();
+addEventListener('resize', resize);
+
+const px = ll => map.latLngToContainerPoint(ll);
+function metersPerPixel() {
+  const c = map.getCenter();
+  return 40075016.686 * Math.cos(c.lat * Math.PI / 180) / Math.pow(2, map.getZoom() + 8);
+}
+
+function glowCircle(x, y, r, color, alpha, width = 1.5) {
+  if (r <= 0 || alpha <= 0) return;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.strokeStyle = color; ctx.globalAlpha = alpha; ctx.lineWidth = width;
+  ctx.shadowColor = color; ctx.shadowBlur = 14;
+  ctx.stroke(); ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+}
+
+function lerpLL(a, b, t) { return { lat: a.lat + (b.lat - a.lat) * t, lng: a.lng + (b.lng - a.lng) * t }; }
+
+let lastNow = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - lastNow) / 1000);
+  lastNow = now;
+  if (playing) {
+    animT += dt;
+    if (animT >= nextSpawn) {
+      spawnEvent();
+      const density = +document.getElementById('density').value;
+      nextSpawn = animT + (11 - density) * (0.6 + Math.random());
+    }
+  }
+  ctx.clearRect(0, 0, innerWidth, innerHeight);
+  const mpp = metersPerPixel();
+
+  // Scintillement ambiant dans l'eau
+  for (const m of motes) {
+    const p = px(m.ll);
+    const a = 0.12 + 0.12 * Math.sin(animT * m.speed + m.phase);
+    ctx.beginPath(); ctx.arc(p.x, p.y, 1.2, 0, Math.PI * 2);
+    ctx.fillStyle = '#9fdcf5'; ctx.globalAlpha = Math.max(0, a); ctx.fill(); ctx.globalAlpha = 1;
+  }
+
+  // Halo respirant des hydrophones
+  hydros.forEach((h, i) => {
+    const p = px(h.marker.getLatLng());
+    const breathe = 10 + 4 * Math.sin(animT * 1.4 + i * 2.1);
+    glowCircle(p.x, p.y, breathe, '#7fd4f0', .35);
+    if (h.flash > 0) {
+      glowCircle(p.x, p.y, 8 + (1 - h.flash) * 46, '#cfeeff', h.flash * .9, 2);
+      h.flash = Math.max(0, h.flash - (playing ? dt : 0) * 1.6);
+    }
+  });
+
+  // Événements sonores
+  for (let ei = events.length - 1; ei >= 0; ei--) {
+    const ev = events[ei];
+    const t = animT - ev.t0;
+    if (t > ev.end) { events.splice(ei, 1); continue; }
+    const sp = px(ev.src);
+    const fade = Math.min(1, (ev.end - t) / 1.6);
+    const tMaxArr = Math.max(...ev.arrivals);
+
+    // Ondes concentriques depuis la source (rayon en mètres réels, vitesse ralentie)
+    for (let k = 0; k < 4; k++) {
+      const rt = t - k * 0.45;
+      if (rt > 0) {
+        const rM = rt * (Math.max(...ev.dists) / tMaxArr) * 1.15; // suit à peu près les impulsions
+        const rP = rM / mpp;
+        glowCircle(sp.x, sp.y, rP, '#6fc8ea', Math.max(0, .5 - rt * .16) * fade);
+      }
+    }
+    // Cœur lumineux de la source
+    const pulse = Math.max(0, 1 - t * .8);
+    ctx.beginPath(); ctx.arc(sp.x, sp.y, 3.5 + pulse * 5, 0, Math.PI * 2);
+    ctx.fillStyle = '#e8f7ff'; ctx.globalAlpha = (0.4 + pulse * .6) * fade;
+    ctx.shadowColor = '#9fdcf5'; ctx.shadowBlur = 18; ctx.fill();
+    ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+
+    // Impulsions qui filent vers chaque hydrophone
+    ev.arrivals.forEach((ta, i) => {
+      const h = hydros[i];
+      const hp = px(h.marker.getLatLng());
+      const prog = t / ta;
+      if (prog <= 1) {
+        const pos = px(lerpLL(ev.src, h.marker.getLatLng(), prog));
+        ctx.strokeStyle = '#7fd4f0'; ctx.globalAlpha = .18 * fade; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(sp.x, sp.y); ctx.lineTo(pos.x, pos.y); ctx.stroke(); ctx.globalAlpha = 1;
+        ctx.beginPath(); ctx.arc(pos.x, pos.y, 2.6, 0, Math.PI * 2);
+        ctx.fillStyle = '#cfeeff'; ctx.shadowColor = '#7fd4f0'; ctx.shadowBlur = 12;
+        ctx.globalAlpha = .95 * fade; ctx.fill(); ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+        if (prog > 0.985 && h.flash <= 0) h.flash = 1;
+      } else {
+        // Trait résiduel hydrophone → source, comme un relèvement acquis
+        ctx.strokeStyle = '#7fd4f0'; ctx.globalAlpha = .3 * fade; ctx.lineWidth = 1;
+        ctx.setLineDash([2, 6]);
+        ctx.beginPath(); ctx.moveTo(hp.x, hp.y); ctx.lineTo(sp.x, sp.y); ctx.stroke();
+        ctx.setLineDash([]); ctx.globalAlpha = 1;
+      }
+    });
+
+    // Verrouillage : réticule tournant + étiquette + Δt
+    const lockT = t - (tMaxArr + 0.25);
+    if (lockT > 0) {
+      const grow = Math.min(1, lockT * 2.5);
+      const r = 16 * grow;
+      ctx.save();
+      ctx.translate(sp.x, sp.y); ctx.rotate(lockT * .8);
+      ctx.strokeStyle = '#e8f7ff'; ctx.globalAlpha = .85 * fade; ctx.lineWidth = 1.4;
+      ctx.shadowColor = '#7fd4f0'; ctx.shadowBlur = 10;
+      for (let q = 0; q < 4; q++) {
+        ctx.beginPath(); ctx.arc(0, 0, r, q * Math.PI / 2 + .3, q * Math.PI / 2 + Math.PI / 2 - .3); ctx.stroke();
+      }
+      ctx.restore(); ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+
+      ctx.font = '11px -apple-system, sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#e8f7ff'; ctx.globalAlpha = .95 * fade * grow;
+      ctx.shadowColor = '#000'; ctx.shadowBlur = 6;
+      ctx.fillText(ev.label.toUpperCase(), sp.x + r + 10, sp.y - 4);
+      ctx.fillStyle = '#8fc4da'; ctx.globalAlpha = .8 * fade * grow;
+      ctx.font = '10px -apple-system, sans-serif';
+      const dts = ev.dtMs.map((d, i) =>
+        `H${i + 1} +${d >= 1000 ? (d / 1000).toFixed(2) + ' s' : d.toFixed(1) + ' ms'}`).join('  ·  ');
+      ctx.fillText(dts, sp.x + r + 10, sp.y + 10);
+      ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+    }
+  }
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ————————————————————————————— HUD ————————————————————————————————
+const playBtn = document.getElementById('playBtn');
+playBtn.addEventListener('click', () => {
+  playing = !playing;
+  playBtn.textContent = playing ? '❚❚ Pause' : '▶ Reprendre';
+  playBtn.classList.toggle('active', playing);
+});
+
+document.getElementById('garabitBtn').addEventListener('click', () => {
+  map.flyTo(GARABIT, 16, { duration: 2.5 });
+});
+document.getElementById('fitBtn').addEventListener('click', () => {
+  map.flyToBounds(lakeLayer.getBounds(), { padding: [40, 40], duration: 2 });
+});
+
+document.getElementById('baseBtn').addEventListener('click', () => {
+  satActive = !satActive;
+  if (satActive) { map.removeLayer(baseDark); baseSat.addTo(map); }
+  else { map.removeLayer(baseSat); baseDark.addTo(map); }
+});
+</script>
+</body>
+</html>
