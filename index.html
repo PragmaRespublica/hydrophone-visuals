@@ -45,10 +45,23 @@
   #vu div { height: 100%; width: 0%; background: linear-gradient(90deg, #2aa9d2, #7fefb0); transition: width .05s; }
   #hint { position: fixed; top: 14px; right: 18px; z-index: 5; color: #ffffff55; font-size: 11px; letter-spacing: .1em; opacity: 0; transition: opacity .3s; }
   body.started #hint { opacity: 1; }
+
+  /* TOC TOC ! — image 2 plein écran */
+  #toctoc {
+    position: fixed; inset: 0; z-index: 8;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0, 0, 5, 0.88);
+    opacity: 0; pointer-events: none; transition: opacity .25s;
+  }
+  #toctoc.show { opacity: 1; }
+  #toctoc img { max-width: 92vw; max-height: 92vh; transform: scale(0.3); }
+  #toctoc.show img { animation: tocpop .45s cubic-bezier(.2, 1.6, .4, 1) forwards; }
+  @keyframes tocpop { to { transform: scale(1); } }
 </style>
 </head>
 <body>
 <canvas id="canvas"></canvas>
+<div id="toctoc"><img src="img/image2.png" alt="Toc toc !"></div>
 
 <div id="overlay">
   <h1>Hydrophone</h1>
@@ -139,7 +152,10 @@ function updateAudio() {
 
   // Détection de transitoire : montée brutale du volume
   const jump = audio.level - prevLevel;
-  if (jump > 0.07) audio.transient = Math.min(1, audio.transient + jump * 4);
+  if (jump > 0.07) {
+    audio.transient = Math.min(1, audio.transient + jump * 4);
+    registerOnset(); // pour la détection « toc toc » (deux coups rapprochés)
+  }
   audio.transient *= 0.92;
   prevLevel = audio.level;
 
@@ -824,6 +840,35 @@ function drawImages(t) {
     ctx.restore();
   }
 }
+
+// ————————————————————————————— TOC TOC ! —————————————————————————————
+// Deux coups rapprochés (« toc toc » dit près du micro, deux frappes)
+// ou double-tap / double-clic sur l'écran → l'image 2 surgit en plein écran
+const tocEl = document.getElementById('toctoc');
+let lastOnset = 0, lastTocShow = 0, tocTimer = null;
+
+function showTocToc() {
+  const now = performance.now();
+  if (now - lastTocShow < 4000) return; // anti-rafale : max une fois toutes les 4 s
+  lastTocShow = now;
+  tocEl.classList.add('show');
+  clearTimeout(tocTimer);
+  tocTimer = setTimeout(() => tocEl.classList.remove('show'), 2500);
+}
+
+function registerOnset() {
+  const now = performance.now();
+  // Deux coups espacés de 120 à 700 ms = « toc toc »
+  if (now - lastOnset > 120 && now - lastOnset < 700) showTocToc();
+  lastOnset = now;
+}
+
+let lastTap = 0;
+canvas.addEventListener('pointerdown', () => {
+  const now = performance.now();
+  if (now - lastTap < 400) showTocToc();
+  lastTap = now;
+});
 
 // ————————————————————————————— Boucle & UI —————————————————————————————
 let mode = 'organic';
